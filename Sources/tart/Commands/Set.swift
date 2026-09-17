@@ -52,8 +52,9 @@ struct Set: AsyncParsableCommand {
   }
 
   func run() async throws {
-    let storageLock = try FileLock(lockURL: Config().tartHomeDir)
-    guard try storageLock.trylock() else {
+    let storageLock = disk != nil || diskSize != nil
+      ? try FileLock(lockURL: Config().tartHomeDir) : nil
+    if let storageLock, try !storageLock.trylock() {
       throw RuntimeError.VMConfigurationError("VM storage is busy; retry after the current operation finishes")
     }
     defer { withExtendedLifetime(storageLock) {} }
@@ -68,7 +69,6 @@ struct Set: AsyncParsableCommand {
     }
 
     var vmConfig = try VMConfig(fromURL: vmDir.configURL)
-    let originalConfig = try vmConfig.toJSON()
 
     if disk != nil || diskSize != nil {
       guard try vmDir.state() == .Stopped else {
@@ -99,9 +99,7 @@ struct Set: AsyncParsableCommand {
       vmConfig.display.unit = display.unit
     }
 
-    if let displayRefit {
-      vmConfig.displayRefit = displayRefit
-    }
+    vmConfig.displayRefit = displayRefit
 
     if randomMAC {
       vmConfig.macAddress = VZMACAddress.randomLocallyAdministered()
@@ -113,9 +111,7 @@ struct Set: AsyncParsableCommand {
       }
     #endif
 
-    if try vmConfig.toJSON() != originalConfig {
-      try vmConfig.save(toURL: vmDir.configURL)
-    }
+    try vmConfig.save(toURL: vmDir.configURL)
 
     if let disk = disk {
       let temporaryDiskURL = try Config().tartTmpDir.appendingPathComponent("set-disk-\(UUID().uuidString)")

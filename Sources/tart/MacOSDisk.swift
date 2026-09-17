@@ -2,6 +2,8 @@ import Foundation
 import zlib
 
 struct MacOSDisk {
+  private static let copyBufferSizeBytes: UInt64 = 8 * 1024 * 1024
+
   static func resize(_ diskURL: URL, to size: UInt64, stagingURL: URL) throws {
     let source = try FileHandle(forReadingFrom: diskURL)
     defer { try? source.close() }
@@ -36,30 +38,30 @@ struct MacOSDisk {
     var remaining = recoveryBlocks * table.blockSize
     while remaining > 0 {
       try Task.checkCancellation()
-      let count = Int(min(remaining, 8 * 1024 * 1024))
+      let count = Int(min(remaining, copyBufferSizeBytes))
       let data = try source.readExactly(count)
       try destination.write(contentsOf: data)
       remaining -= UInt64(count)
     }
 
-    table.entries.setUInt64(recoveryStart, at: 2 * 128 + 32)
-    table.entries.setUInt64(lastUsableBlock, at: 2 * 128 + 40)
+    table.entries.setUInt64(recoveryStart, at: GPTEntry.recoveryOffset + GPTEntry.firstBlockOffset)
+    table.entries.setUInt64(lastUsableBlock, at: GPTEntry.recoveryOffset + GPTEntry.lastBlockOffset)
     let checksum = table.entries.crc32Checksum
-    table.primary.setUInt64(lastBlock, at: 32)
-    table.primary.setUInt64(lastUsableBlock, at: 48)
-    table.primary.setUInt32(checksum, at: 88)
+    table.primary.setUInt64(lastBlock, at: GPTHeader.alternateBlockOffset)
+    table.primary.setUInt64(lastUsableBlock, at: GPTHeader.lastUsableBlockOffset)
+    table.primary.setUInt32(checksum, at: GPTHeader.entriesChecksumOffset)
     table.primary.updateHeaderChecksum()
-    table.backup.setUInt64(lastBlock, at: 24)
-    table.backup.setUInt64(lastUsableBlock, at: 48)
-    table.backup.setUInt64(lastBlock - table.tableBlocks, at: 72)
-    table.backup.setUInt32(checksum, at: 88)
+    table.backup.setUInt64(lastBlock, at: GPTHeader.currentBlockOffset)
+    table.backup.setUInt64(lastUsableBlock, at: GPTHeader.lastUsableBlockOffset)
+    table.backup.setUInt64(lastBlock - table.tableBlocks, at: GPTHeader.entriesBlockOffset)
+    table.backup.setUInt32(checksum, at: GPTHeader.entriesChecksumOffset)
     table.backup.updateHeaderChecksum()
-    table.mbr.setUInt32(UInt32(min(lastBlock, UInt64(UInt32.max))), at: 446 + 12)
+    table.mbr.setUInt32(UInt32(min(lastBlock, UInt64(UInt32.max))), at: ProtectiveMBR.partitionSizeOffset)
 
     try destination.write(table.entries, at: (lastBlock - table.tableBlocks) * table.blockSize)
     try destination.write(table.backup, at: lastBlock * table.blockSize)
-    try destination.write(table.entries, at: 2 * table.blockSize)
-    try destination.write(table.primary, at: table.blockSize)
+    try destination.write(table.entries, at: GPTHeader.primaryEntriesBlock * table.blockSize)
+    try destination.write(table.primary, at: GPTHeader.primaryBlock * table.blockSize)
     try destination.write(table.mbr, at: 0)
     try destination.synchronize()
     try destination.close()
@@ -74,6 +76,10 @@ struct MacOSDisk {
   }
 
   private struct PartitionTable {
+    private static let supportedBlockSizes: [UInt64] = [512, 4096]
+    private static let minimumBlockCount: UInt64 = 68
+    private static let partitionTypes = [GPTEntry.iBootType, GPTEntry.apfsType, GPTEntry.recoveryType]
+
     let blockSize: UInt64
     let tableBlocks: UInt64
     var mbr: Data
@@ -84,97 +90,140 @@ struct MacOSDisk {
     let recoveryEnd: UInt64
 
     init(_ file: FileHandle, diskSize: UInt64) throws {
-      let signature = Data("EFI PART".utf8)
-      try file.seek(toOffset: 512)
-      if try file.readExactly(8) == signature {
-        blockSize = 512
-      } else {
-        try file.seek(toOffset: 4096)
-        guard try file.readExactly(8) == signature else {
-          throw RuntimeError.FailedToResizeDisk("disk does not contain a supported GPT")
-        }
-        blockSize = 4096
+      guard let blockSize = try Self.supportedBlockSizes.first(where: {
+        try file.readExactly(GPTHeader.signature.count, at: $0) == GPTHeader.signature
+      }) else {
+        throw RuntimeError.FailedToResizeDisk("disk does not contain a supported GPT")
       }
-      guard diskSize.isMultiple(of: blockSize), diskSize / blockSize >= 68 else {
+      self.blockSize = blockSize
+      guard diskSize.isMultiple(of: blockSize), diskSize / blockSize >= Self.minimumBlockCount else {
         throw RuntimeError.FailedToResizeDisk("invalid GPT disk size")
       }
-      tableBlocks = 128 * 128 / blockSize
+      tableBlocks = UInt64(GPTEntry.tableSize) / blockSize
       mbr = try file.readExactly(Int(blockSize), at: 0)
-      primary = try file.readExactly(Int(blockSize), at: blockSize)
+      primary = try file.readExactly(Int(blockSize), at: GPTHeader.primaryBlock * blockSize)
       try Self.validateHeader(primary)
-      let backupBlock = primary.uint64(at: 32)
-      let firstUsableBlock = primary.uint64(at: 40)
-      let lastUsableBlock = primary.uint64(at: 48)
-      guard primary.uint64(at: 24) == 1,
-            primary.uint64(at: 72) == 2,
-            backupBlock >= 2 * tableBlocks + 3,
+      let backupBlock = primary.uint64(at: GPTHeader.alternateBlockOffset)
+      let firstUsableBlock = primary.uint64(at: GPTHeader.firstUsableBlockOffset)
+      let lastUsableBlock = primary.uint64(at: GPTHeader.lastUsableBlockOffset)
+      guard primary.uint64(at: GPTHeader.currentBlockOffset) == GPTHeader.primaryBlock,
+            primary.uint64(at: GPTHeader.entriesBlockOffset) == GPTHeader.primaryEntriesBlock,
+            backupBlock >= GPTHeader.primaryEntriesBlock + 2 * tableBlocks + 1,
             backupBlock < diskSize / blockSize,
-            firstUsableBlock >= 2 + tableBlocks,
+            firstUsableBlock >= GPTHeader.primaryEntriesBlock + tableBlocks,
             lastUsableBlock < backupBlock - tableBlocks,
             firstUsableBlock <= lastUsableBlock else {
         throw RuntimeError.FailedToResizeDisk("invalid primary GPT bounds")
       }
       backup = try file.readExactly(Int(blockSize), at: backupBlock * blockSize)
       try Self.validateHeader(backup)
-      guard backup.uint64(at: 24) == backupBlock,
-            backup.uint64(at: 32) == 1,
-            backup.uint64(at: 72) == backupBlock - tableBlocks,
-            backup[40..<72] == primary[40..<72],
-            backup[80..<92] == primary[80..<92] else {
+      guard backup.uint64(at: GPTHeader.currentBlockOffset) == backupBlock,
+            backup.uint64(at: GPTHeader.alternateBlockOffset) == GPTHeader.primaryBlock,
+            backup.uint64(at: GPTHeader.entriesBlockOffset) == backupBlock - tableBlocks,
+            backup[GPTHeader.usableBlocksAndDiskGUIDRange] == primary[GPTHeader.usableBlocksAndDiskGUIDRange],
+            backup[GPTHeader.entriesMetadataRange] == primary[GPTHeader.entriesMetadataRange] else {
         throw RuntimeError.FailedToResizeDisk("primary and backup GPT headers do not match")
       }
-      entries = try file.readExactly(128 * 128, at: 2 * blockSize)
-      let backupEntries = try file.readExactly(128 * 128, at: (backupBlock - tableBlocks) * blockSize)
-      guard entries == backupEntries, entries.crc32Checksum == primary.uint32(at: 88) else {
+      entries = try file.readExactly(GPTEntry.tableSize, at: GPTHeader.primaryEntriesBlock * blockSize)
+      let backupEntries = try file.readExactly(GPTEntry.tableSize, at: (backupBlock - tableBlocks) * blockSize)
+      guard entries == backupEntries, entries.crc32Checksum == primary.uint32(at: GPTHeader.entriesChecksumOffset) else {
         throw RuntimeError.FailedToResizeDisk("invalid GPT partition checksum or backup")
       }
 
-      let partitionTypes: [[UInt8]] = [
-        [0x61, 0x69, 0x64, 0x69, 0x00, 0x67, 0xAA, 0x11, 0xAA, 0x11, 0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC],
-        [0xEF, 0x57, 0x34, 0x7C, 0x00, 0x00, 0xAA, 0x11, 0xAA, 0x11, 0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC],
-        [0x72, 0x76, 0x63, 0x52, 0x00, 0x79, 0xAA, 0x11, 0xAA, 0x11, 0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC],
-      ]
       var previousEnd = firstUsableBlock - 1
-      for (index, type) in partitionTypes.enumerated() {
-        let offset = index * 128
-        let start = entries.uint64(at: offset + 32)
-        let end = entries.uint64(at: offset + 40)
-        guard entries[offset..<offset + 16] == Data(type),
+      for (index, type) in Self.partitionTypes.enumerated() {
+        let offset = index * GPTEntry.size
+        let start = entries.uint64(at: offset + GPTEntry.firstBlockOffset)
+        let end = entries.uint64(at: offset + GPTEntry.lastBlockOffset)
+        guard entries[offset..<offset + GPTEntry.typeSize] == type,
               start > previousEnd, end >= start, end <= lastUsableBlock else {
           throw RuntimeError.FailedToResizeDisk("expected iBoot, APFS and Recovery partitions in disk order")
         }
         previousEnd = end
       }
-      for index in 3..<128 {
-        guard entries[index * 128..<index * 128 + 16].allSatisfy({ $0 == 0 }) else {
+      for index in Self.partitionTypes.count..<GPTEntry.count {
+        let offset = index * GPTEntry.size
+        guard entries[offset..<offset + GPTEntry.typeSize].allSatisfy({ $0 == 0 }) else {
           throw RuntimeError.FailedToResizeDisk("disk contains additional partitions")
         }
       }
-      guard mbr[510] == 0x55, mbr[511] == 0xAA,
-            mbr[446 + 4] == 0xEE, mbr.uint32(at: 446 + 8) == 1,
-            mbr[462..<510].allSatisfy({ $0 == 0 }) else {
+      guard mbr[ProtectiveMBR.signatureRange] == ProtectiveMBR.signature,
+            mbr[ProtectiveMBR.partitionTypeOffset] == ProtectiveMBR.partitionType,
+            mbr.uint32(at: ProtectiveMBR.partitionStartOffset) == GPTHeader.primaryBlock,
+            mbr[ProtectiveMBR.unusedEntriesRange].allSatisfy({ $0 == 0 }) else {
         throw RuntimeError.FailedToResizeDisk("invalid protective MBR")
       }
-      recoveryStart = entries.uint64(at: 2 * 128 + 32)
-      recoveryEnd = entries.uint64(at: 2 * 128 + 40)
+      recoveryStart = entries.uint64(at: GPTEntry.recoveryOffset + GPTEntry.firstBlockOffset)
+      recoveryEnd = entries.uint64(at: GPTEntry.recoveryOffset + GPTEntry.lastBlockOffset)
     }
 
     private static func validateHeader(_ header: Data) throws {
-      guard header.prefix(8) == Data("EFI PART".utf8),
-            header.uint32(at: 8) == 0x00010000,
-            header.uint32(at: 12) == 92,
-            header.uint32(at: 20) == 0,
-            header.uint32(at: 80) == 128,
-            header.uint32(at: 84) == 128 else {
+      guard header.prefix(GPTHeader.signature.count) == GPTHeader.signature,
+            header.uint32(at: GPTHeader.revisionOffset) == GPTHeader.revision,
+            header.uint32(at: GPTHeader.sizeOffset) == GPTHeader.size,
+            header.uint32(at: GPTHeader.reservedOffset) == 0,
+            header.uint32(at: GPTHeader.entryCountOffset) == GPTEntry.count,
+            header.uint32(at: GPTHeader.entrySizeOffset) == GPTEntry.size else {
         throw RuntimeError.FailedToResizeDisk("unsupported GPT header")
       }
-      var bytes = header.prefix(92)
-      bytes.setUInt32(0, at: 16)
-      guard bytes.crc32Checksum == header.uint32(at: 16) else {
+      var bytes = header.prefix(GPTHeader.size)
+      bytes.setUInt32(0, at: GPTHeader.checksumOffset)
+      guard bytes.crc32Checksum == header.uint32(at: GPTHeader.checksumOffset) else {
         throw RuntimeError.FailedToResizeDisk("invalid GPT header checksum")
       }
     }
   }
+}
+
+private enum GPTHeader {
+  static let signature = Data("EFI PART".utf8)
+  static let revision: UInt32 = 0x00010000
+  static let size = 92
+  static let primaryBlock: UInt64 = 1
+  static let primaryEntriesBlock: UInt64 = 2
+
+  static let revisionOffset = 8
+  static let sizeOffset = 12
+  static let checksumOffset = 16
+  static let reservedOffset = 20
+  static let currentBlockOffset = 24
+  static let alternateBlockOffset = 32
+  static let firstUsableBlockOffset = 40
+  static let lastUsableBlockOffset = 48
+  static let entriesBlockOffset = 72
+  static let entryCountOffset = 80
+  static let entrySizeOffset = 84
+  static let entriesChecksumOffset = 88
+
+  static let usableBlocksAndDiskGUIDRange = firstUsableBlockOffset..<entriesBlockOffset
+  static let entriesMetadataRange = entryCountOffset..<size
+}
+
+private enum GPTEntry {
+  static let count = 128
+  static let size = 128
+  static let tableSize = count * size
+  static let typeSize = 16
+  static let firstBlockOffset = 32
+  static let lastBlockOffset = 40
+  static let recoveryOffset = 2 * size
+
+  static let iBootType = Data([0x61, 0x69, 0x64, 0x69, 0x00, 0x67, 0xAA, 0x11, 0xAA, 0x11, 0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC])
+  static let apfsType = Data([0xEF, 0x57, 0x34, 0x7C, 0x00, 0x00, 0xAA, 0x11, 0xAA, 0x11, 0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC])
+  static let recoveryType = Data([0x72, 0x76, 0x63, 0x52, 0x00, 0x79, 0xAA, 0x11, 0xAA, 0x11, 0x00, 0x30, 0x65, 0x43, 0xEC, 0xAC])
+}
+
+private enum ProtectiveMBR {
+  static let signature = Data([0x55, 0xAA])
+  static let signatureOffset = 510
+  static let signatureRange = signatureOffset..<signatureOffset + signature.count
+  static let partitionType: UInt8 = 0xEE
+  static let partitionTableOffset = 446
+  static let partitionEntrySize = 16
+  static let partitionTypeOffset = partitionTableOffset + 4
+  static let partitionStartOffset = partitionTableOffset + 8
+  static let partitionSizeOffset = partitionTableOffset + 12
+  static let unusedEntriesRange = partitionTableOffset + partitionEntrySize..<signatureOffset
 }
 
 private extension FileHandle {
@@ -204,11 +253,11 @@ private extension Data {
   }
 
   mutating func setUInt32(_ value: UInt32, at offset: Int) {
-    Swift.withUnsafeBytes(of: value.littleEndian) { replaceSubrange(offset..<offset + 4, with: $0) }
+    Swift.withUnsafeBytes(of: value.littleEndian) { replaceSubrange(offset..<offset + MemoryLayout<UInt32>.size, with: $0) }
   }
 
   mutating func setUInt64(_ value: UInt64, at offset: Int) {
-    Swift.withUnsafeBytes(of: value.littleEndian) { replaceSubrange(offset..<offset + 8, with: $0) }
+    Swift.withUnsafeBytes(of: value.littleEndian) { replaceSubrange(offset..<offset + MemoryLayout<UInt64>.size, with: $0) }
   }
 
   var crc32Checksum: UInt32 {
@@ -216,7 +265,7 @@ private extension Data {
   }
 
   mutating func updateHeaderChecksum() {
-    setUInt32(0, at: 16)
-    setUInt32(prefix(92).crc32Checksum, at: 16)
+    setUInt32(0, at: GPTHeader.checksumOffset)
+    setUInt32(prefix(GPTHeader.size).crc32Checksum, at: GPTHeader.checksumOffset)
   }
 }
